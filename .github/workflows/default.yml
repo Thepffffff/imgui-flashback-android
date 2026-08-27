@@ -124,6 +124,9 @@ jobs:
       #    b) mangled overload parameters ....... ..._Limgui_ImVec2_2IF
       #    c) runtime class + descriptor strings . "imgui/ImVec2", "(Limgui/ImVec2;)V"
       #  #include lines are skipped so upstream headers stay intact.
+      #
+      #  The leftover check must EXCLUDE the already-shaded prefix, because
+      #  Java_imgui_moulberry90_* still matches Java_imgui_[A-Za-z0-9_]*.
       # -------------------------------------------------------------------
       - name: Shade JNI names to the fork's package
         run: |
@@ -151,14 +154,20 @@ jobs:
                 -e "/#[[:space:]]*include/! s|Limgui/|L${PKG_S}/|g"
 
           AFTER=$( { grep -rho "Java_${PKG_U}_[A-Za-z0-9_]*" . || true; } | sort -u | wc -l)
-          LEFT=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } | sort -u | wc -l)
+          LEFT=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } \
+                    | sort -u | grep -v "^Java_${PKG_U}_" | wc -l)
           echo "distinct JNI exports after shading: $AFTER (unshaded leftovers: $LEFT)"
+
           if [ "$LEFT" != "0" ]; then
-            echo "::error::Some JNI symbols were not shaded."; exit 1
+            echo "::error::Some JNI symbols were not shaded. Examples:"
+            { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } \
+              | sort -u | grep -v "^Java_${PKG_U}_" | head -20
+            exit 1
           fi
           if [ "$AFTER" != "$BEFORE" ]; then
             echo "::error::Export count changed during shading ($BEFORE -> $AFTER)."; exit 1
           fi
+          echo "Shading OK."
 
       # -------------------------------------------------------------------
       #  Step 3: CMake project for the Android build
