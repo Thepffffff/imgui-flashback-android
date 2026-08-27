@@ -140,6 +140,7 @@ jobs:
             echo "::warning::No reference/*.so found in self/reference - skipping pre-shading cross-check."
             exit 0
           fi
+          REF="$(realpath "$REF")"
           echo "Using reference .so: $REF"
 
           cd upstream/imgui-binding/build/jni
