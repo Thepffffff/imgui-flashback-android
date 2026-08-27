@@ -1,0 +1,310 @@
+name: Build imgui-moulberry90 native (Android arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      abis:
+        description: 'Android ABIs to build (space separated)'
+        default: 'arm64-v8a'
+        type: string
+      android_api:
+        description: 'Minimum Android API level'
+        default: '24'
+        type: string
+      imgui_java_tag:
+        description: 'Upstream SpaiR/imgui-java tag to build from'
+        default: 'v1.90.0'
+        type: string
+      shaded_package:
+        description: 'Target shaded package, slash form, no trailing slash'
+        default: 'imgui/moulberry90'
+        type: string
+  push:
+    branches: [ main, master ]
+
+env:
+  UPSTREAM_REPO: SpaiR/imgui-java
+  LIB_BASENAME: imgui-moulberry90-java64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout this repo (for optional reference/ .so)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          set -euo pipefail
+          echo "abis=${{ inputs.abis || 'arm64-v8a' }}"        >> "$GITHUB_OUTPUT"
+          echo "api=${{ inputs.android_api || '24' }}"         >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.imgui_java_tag || 'v1.90.0' }}" >> "$GITHUB_OUTPUT"
+          PKG="${{ inputs.shaded_package || 'imgui/moulberry90' }}"
+          echo "pkg_slash=$PKG"                        >> "$GITHUB_OUTPUT"
+          echo "pkg_under=$(echo "$PKG" | tr '/' '_')" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      #  Toolchain
+      # -------------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install host build deps (needed by the codegen step)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ant build-essential binutils cmake ninja-build
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          local-cache: true
+
+      # -------------------------------------------------------------------
+      #  Upstream source at the version that matches the jar
+      # -------------------------------------------------------------------
+      - name: Clone upstream imgui-java (with submodules)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.cfg.outputs.tag }}" \
+            --recurse-submodules --shallow-submodules \
+            "https://github.com/${UPSTREAM_REPO}.git" upstream
+          cd upstream
+          echo "--- submodule revisions ---"
+          git submodule status || true
+
+      - name: Sanity check Dear ImGui version
+        run: |
+          set -uo pipefail
+          cd upstream
+          H=$(find . -name imgui.h | head -1)
+          echo "header: $H"
+          grep -E '#define IMGUI_VERSION(_NUM)? ' "$H" || true
+          if ! grep -q '#define IMGUI_VERSION  *"1\.90\.9' "$H"; then
+            echo "::warning::Dear ImGui is not 1.90.9 - struct layouts may not match the jar."
+          fi
+
+      # -------------------------------------------------------------------
+      #  Step 1: generate the JNI C++ (host-side codegen)
+      #  Only imgui-binding/build/jni/ is needed. The linux64 native link
+      #  that follows is irrelevant here, so its failure is tolerated.
+      # -------------------------------------------------------------------
+      - name: Generate JNI sources
+        run: |
+          set -uo pipefail
+          cd upstream
+          chmod +x gradlew
+          ./gradlew --no-daemon :imgui-binding:generateLibs -Denvs=linux64 -Dlocal \
+            || echo "::notice::generateLibs exited non-zero (host native link stage). Continuing if jni/ exists."
+          if [ ! -d imgui-binding/build/jni ]; then
+            echo "::error::imgui-binding/build/jni was not produced. Codegen task name may differ for this tag."
+            ./gradlew --no-daemon :imgui-binding:tasks --all | head -80 || true
+            exit 1
+          fi
+          echo "--- generated jni tree ---"
+          ls imgui-binding/build/jni | head -60
+          echo "cpp files: $(find imgui-binding/build/jni -name '*.cpp' | wc -l)"
+
+      # -------------------------------------------------------------------
+      #  Step 2: shade the package  imgui.*  ->  imgui.moulberry90.*
+      #
+      #  Three name forms are baked in at compile time and all must change:
+      #    a) exported function names ........... Java_imgui_ImGui_nBegin
+      #    b) mangled overload parameters ....... ..._Limgui_ImVec2_2IF
+      #    c) runtime class + descriptor strings . "imgui/ImVec2", "(Limgui/ImVec2;)V"
+      #  #include lines are skipped so upstream headers stay intact.
+      # -------------------------------------------------------------------
+      - name: Shade JNI names to the fork's package
+        run: |
+          set -euo pipefail
+          cd upstream/imgui-binding/build/jni
+          PKG_U='${{ steps.cfg.outputs.pkg_under }}'   # imgui_moulberry90
+          PKG_S='${{ steps.cfg.outputs.pkg_slash }}'   # imgui/moulberry90
+
+          BEFORE=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } | sort -u | wc -l)
+          echo "distinct JNI exports before shading: $BEFORE"
+          if [ "$BEFORE" = "0" ]; then
+            echo "::error::No Java_imgui_* symbols found - codegen output looks wrong."; exit 1
+          fi
+
+          # a + b: symbol names
+          { grep -rl --include='*.cpp' --include='*.h' -e 'Java_imgui_' -e 'Limgui_' . || true; } \
+            | xargs -r sed -i \
+                -e "s/Java_imgui_/Java_${PKG_U}_/g" \
+                -e "s/Limgui_/L${PKG_U}_/g"
+
+          # c: JNI class names and type descriptors inside string literals
+          { grep -rl --include='*.cpp' --include='*.h' -e '"imgui/' -e 'Limgui/' . || true; } \
+            | xargs -r sed -i \
+                -e "/#[[:space:]]*include/! s|\"imgui/|\"${PKG_S}/|g" \
+                -e "/#[[:space:]]*include/! s|Limgui/|L${PKG_S}/|g"
+
+          AFTER=$( { grep -rho "Java_${PKG_U}_[A-Za-z0-9_]*" . || true; } | sort -u | wc -l)
+          LEFT=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } | sort -u | wc -l)
+          echo "distinct JNI exports after shading: $AFTER (unshaded leftovers: $LEFT)"
+          if [ "$LEFT" != "0" ]; then
+            echo "::error::Some JNI symbols were not shaded."; exit 1
+          fi
+          if [ "$AFTER" != "$BEFORE" ]; then
+            echo "::error::Export count changed during shading ($BEFORE -> $AFTER)."; exit 1
+          fi
+
+      # -------------------------------------------------------------------
+      #  Step 3: CMake project for the Android build
+      # -------------------------------------------------------------------
+      - name: Write CMakeLists
+        run: |
+          set -euo pipefail
+          cat > upstream/imgui-binding/build/jni/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(imgui_moulberry90_jni CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_VISIBILITY_PRESET default)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+          if(NOT DEFINED LIB_NAME)
+            message(FATAL_ERROR "Pass -DLIB_NAME=<library base name>")
+          endif()
+
+          file(GLOB_RECURSE SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+          list(LENGTH SRC SRC_COUNT)
+          message(STATUS "imgui-jni: compiling ${SRC_COUNT} translation units")
+          if(SRC_COUNT EQUAL 0)
+            message(FATAL_ERROR "No .cpp sources found in generated jni dir")
+          endif()
+
+          add_library(${LIB_NAME} SHARED ${SRC})
+
+          target_include_directories(${LIB_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+          target_compile_options(${LIB_NAME} PRIVATE
+            -O2 -fno-strict-aliasing
+            -Wno-unused-function -Wno-unused-variable
+            -Wno-deprecated-declarations -Wno-unused-but-set-variable
+          )
+
+          target_link_libraries(${LIB_NAME} PRIVATE android log)
+
+          # 16 KB page size is required by Android 15+ devices
+          target_link_options(${LIB_NAME} PRIVATE
+            -Wl,-z,max-page-size=16384
+            -Wl,--build-id=sha1
+          )
+          CMAKE
+          echo "CMakeLists written:"
+          head -5 upstream/imgui-binding/build/jni/CMakeLists.txt
+
+      # -------------------------------------------------------------------
+      #  Step 4: compile per ABI
+      # -------------------------------------------------------------------
+      - name: Build native library
+        run: |
+          set -euo pipefail
+          JNI_DIR="$PWD/upstream/imgui-binding/build/jni"
+          OUT="$PWD/artifacts"
+          mkdir -p "$OUT"
+
+          for ABI in ${{ steps.cfg.outputs.abis }}; do
+            echo "::group::Building $ABI"
+            cmake -S "$JNI_DIR" -B "build-$ABI" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM="android-${{ steps.cfg.outputs.api }}" \
+              -DANDROID_STL=c++_static \
+              -DANDROID_CPP_FEATURES="rtti exceptions" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DLIB_NAME="${LIB_BASENAME}"
+            cmake --build "build-$ABI" --parallel
+            mkdir -p "$OUT/$ABI"
+            cp "build-$ABI/lib${LIB_BASENAME}.so" "$OUT/$ABI/"
+            echo "::endgroup::"
+          done
+
+          echo "--- built ---"
+          find "$OUT" -name '*.so' -exec ls -la {} \;
+          find "$OUT" -name '*.so' -exec file {} \;
+
+      - name: Strip (keep dynamic symbols)
+        run: |
+          set -euo pipefail
+          STRIP="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          for so in $(find artifacts -name '*.so'); do
+            B=$(stat -c%s "$so")
+            "$STRIP" --strip-unneeded "$so"
+            echo "$so: $B -> $(stat -c%s "$so") bytes"
+          done
+
+      # -------------------------------------------------------------------
+      #  Step 5: verify exported symbols against the original desktop .so
+      # -------------------------------------------------------------------
+      - name: Verify JNI exports against reference .so
+        run: |
+          set -uo pipefail
+          PKG_U='${{ steps.cfg.outputs.pkg_under }}'
+          REF=$(find self/reference -name '*.so' 2>/dev/null | head -1)
+          MINE=$(find artifacts -name '*.so' | head -1)
+
+          nm -D --defined-only "$MINE" | grep " Java_${PKG_U}_" | awk '{print $NF}' | sort > mine.txt
+          echo "exports in built .so: $(wc -l < mine.txt)"
+
+          if [ -z "$REF" ]; then
+            echo "::warning::No reference/*.so committed - symbol diff skipped. Commit the original desktop .so to reference/ to enable this check."
+            exit 0
+          fi
+
+          nm -D --defined-only "$REF" | grep " Java_${PKG_U}_" | awk '{print $NF}' | sort > ref.txt
+          echo "exports in reference .so: $(wc -l < ref.txt)"
+
+          # win32hideFromTaskBar is a Windows-only stub, its absence is expected.
+          MISSING=$(comm -23 ref.txt mine.txt | grep -v 'win32hideFromTaskBar')
+          EXTRA=$(comm -13 ref.txt mine.txt)
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::Symbols the jar needs but this build does not export:"
+            echo "$MISSING" | head -40
+            echo "total missing: $(echo "$MISSING" | wc -l)"
+            exit 1
+          fi
+          if [ -n "$EXTRA" ]; then
+            echo "::warning::Extra symbols not in the reference (usually harmless): $(echo "$EXTRA" | wc -l)"
+            echo "$EXTRA" | head -20
+          fi
+          echo "Symbol check PASSED."
+
+      - name: Confirm imconfig.h untouched
+        run: |
+          set -uo pipefail
+          echo "nDebugCheckVersionAndDataLayout compares sizeof(ImGuiIO, ImGuiStyle, ImVec2, ImVec4, ImDrawVert, ImDrawIdx)."
+          cd upstream
+          git diff --stat -- '*imconfig.h'
+          echo "(no diff listed above = stock = good)"
+
+      # -------------------------------------------------------------------
+      - name: Upload native libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgui-moulberry90-android-natives
+          path: artifacts/**/*.so
+          if-no-files-found: error
+
+      - name: Upload generated JNI sources (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-jni-sources
+          path: upstream/imgui-binding/build/jni
+          retention-days: 7
+          if-no-files-found: warn
