@@ -117,6 +117,79 @@ jobs:
           echo "cpp files: $(find imgui-binding/build/jni -name '*.cpp' | wc -l)"
 
       # -------------------------------------------------------------------
+      #  Step 1.5: cross-check codegen output against the reference .so
+      #  committed at self/reference/*.so, BEFORE spending time shading or
+      #  building. The reference .so has real (possibly hand/custom) shaded
+      #  names, so we do NOT try to reverse-guess them back to "imgui/...".
+      #  Instead we forward-transform the raw codegen names using the exact
+      #  same two substitutions the "Shade JNI names" step performs
+      #  (Java_imgui_ -> Java_${PKG_U}_ , Limgui_ -> L${PKG_U}_) and compare
+      #  that against the reference .so's actual exported names. This mirrors
+      #  reality instead of assuming anything about how the reference was
+      #  named. Fails on ANY symbol present in the reference but absent from
+      #  the (transformed) codegen output, and prints every mismatched/
+      #  missing name explicitly.
+      # -------------------------------------------------------------------
+      - name: Cross-check codegen exports against reference .so (pre-shading)
+        run: |
+          set -uo pipefail
+          PKG_U='${{ steps.cfg.outputs.pkg_under }}'
+          REF=$(find self/reference -name '*.so' 2>/dev/null | head -1)
+
+          if [ -z "$REF" ]; then
+            echo "::warning::No reference/*.so found in self/reference - skipping pre-shading cross-check."
+            exit 0
+          fi
+          echo "Using reference .so: $REF"
+
+          cd upstream/imgui-binding/build/jni
+
+          grep -rho 'Java_imgui_[A-Za-z0-9_]*' . | sort -u > /tmp/codegen_raw.txt
+          echo "codegen (pre-shade) exports: $(wc -l < /tmp/codegen_raw.txt)"
+
+          # Forward-transform codegen names the SAME way the real shading
+          # step will (string-level, not touching any files here) so we
+          # compare shaded-vs-shaded without assuming anything about the
+          # reference .so's naming scheme.
+          sed -e "s/Java_imgui_/Java_${PKG_U}_/g" \
+              -e "s/Limgui_/L${PKG_U}_/g" \
+              /tmp/codegen_raw.txt | sort -u > /tmp/codegen_shaded.txt
+          echo "codegen exports (transformed to shaded form): $(wc -l < /tmp/codegen_shaded.txt)"
+
+          nm -D --defined-only "$REF" \
+            | awk '{print $NF}' \
+            | grep "Java_" \
+            | sort -u > /tmp/ref_exports.txt
+          echo "reference .so exports: $(wc -l < /tmp/ref_exports.txt)"
+
+          if [ ! -s /tmp/ref_exports.txt ]; then
+            echo "::error::Reference .so has zero Java_* exports - wrong file committed at self/reference/*.so?"
+            exit 1
+          fi
+
+          MISSING_FROM_CODEGEN=$(comm -23 /tmp/ref_exports.txt /tmp/codegen_shaded.txt || true)
+          MISSING_FROM_REF=$(comm -13 /tmp/ref_exports.txt /tmp/codegen_shaded.txt || true)
+
+          FAIL=0
+          if [ -n "$MISSING_FROM_CODEGEN" ]; then
+            FAIL=1
+            COUNT=$(echo "$MISSING_FROM_CODEGEN" | grep -c .)
+            echo "::error::$COUNT symbol(s) exist in the reference .so but have NO matching codegen output after shading (name mismatch, custom naming, or upstream tag drift). Every missing symbol:"
+            echo "$MISSING_FROM_CODEGEN" | sed 's/^/  MISSING FROM CODEGEN: /'
+          fi
+          if [ -n "$MISSING_FROM_REF" ]; then
+            COUNT2=$(echo "$MISSING_FROM_REF" | grep -c .)
+            echo "::warning::$COUNT2 symbol(s) produced by codegen (post-shade) but absent from the reference .so (may be harmless additions):"
+            echo "$MISSING_FROM_REF" | sed 's/^/  EXTRA IN CODEGEN: /'
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            echo "::error::Pre-shading cross-check FAILED - aborting before shading/build. See MISSING FROM CODEGEN lines above for exact symbol names."
+            exit 1
+          fi
+          echo "Pre-shading cross-check PASSED: every reference export has a matching codegen symbol."
+
+      # -------------------------------------------------------------------
       #  Step 2: shade the package  imgui.*  ->  imgui.moulberry90.*
       #
       #  Three name forms are baked in at compile time and all must change:
@@ -127,6 +200,14 @@ jobs:
       #
       #  The leftover check must EXCLUDE the already-shaded prefix, because
       #  Java_imgui_moulberry90_* still matches Java_imgui_[A-Za-z0-9_]*.
+      #
+      #  NOTE: every grep that is expected to legitimately find ZERO matches
+      #  on a successful run is wrapped in its own `{ ... || true; }` group
+      #  so that under `set -euo pipefail` a clean (zero-match) result does
+      #  NOT propagate a non-zero exit status through the pipeline and abort
+      #  the script. Previously LEFT=$(... | grep -v ... | wc -l) failed the
+      #  whole step whenever shading was fully successful, because pipefail
+      #  surfaces grep -v's exit-1-on-no-match through the pipe.
       # -------------------------------------------------------------------
       - name: Shade JNI names to the fork's package
         run: |
@@ -154,14 +235,19 @@ jobs:
                 -e "/#[[:space:]]*include/! s|Limgui/|L${PKG_S}/|g"
 
           AFTER=$( { grep -rho "Java_${PKG_U}_[A-Za-z0-9_]*" . || true; } | sort -u | wc -l)
+
           LEFT=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } \
-                    | sort -u | grep -v "^Java_${PKG_U}_" | wc -l)
+                    | sort -u \
+                    | { grep -v "^Java_${PKG_U}_" || true; } \
+                    | wc -l)
           echo "distinct JNI exports after shading: $AFTER (unshaded leftovers: $LEFT)"
 
           if [ "$LEFT" != "0" ]; then
             echo "::error::Some JNI symbols were not shaded. Examples:"
             { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } \
-              | sort -u | grep -v "^Java_${PKG_U}_" | head -20
+              | sort -u \
+              | { grep -v "^Java_${PKG_U}_" || true; } \
+              | head -20
             exit 1
           fi
           if [ "$AFTER" != "$BEFORE" ]; then
@@ -258,6 +344,8 @@ jobs:
 
       # -------------------------------------------------------------------
       #  Step 5: verify exported symbols against the original desktop .so
+      #  (post-build, shaded-name comparison). Fails on ANY missing symbol
+      #  and prints every missing/mismatched name explicitly.
       # -------------------------------------------------------------------
       - name: Verify JNI exports against reference .so
         run: |
@@ -278,18 +366,19 @@ jobs:
           echo "exports in reference .so: $(wc -l < ref.txt)"
 
           # win32hideFromTaskBar is a Windows-only stub, its absence is expected.
-          MISSING=$(comm -23 ref.txt mine.txt | grep -v 'win32hideFromTaskBar')
-          EXTRA=$(comm -13 ref.txt mine.txt)
+          MISSING=$(comm -23 ref.txt mine.txt | grep -v 'win32hideFromTaskBar' || true)
+          EXTRA=$(comm -13 ref.txt mine.txt || true)
 
           if [ -n "$MISSING" ]; then
-            echo "::error::Symbols the jar needs but this build does not export:"
-            echo "$MISSING" | head -40
-            echo "total missing: $(echo "$MISSING" | wc -l)"
+            COUNT=$(echo "$MISSING" | grep -c .)
+            echo "::error::$COUNT symbol(s) the jar needs but this build does not export. Every missing symbol:"
+            echo "$MISSING" | sed 's/^/  MISSING: /'
             exit 1
           fi
           if [ -n "$EXTRA" ]; then
-            echo "::warning::Extra symbols not in the reference (usually harmless): $(echo "$EXTRA" | wc -l)"
-            echo "$EXTRA" | head -20
+            COUNT2=$(echo "$EXTRA" | grep -c .)
+            echo "::warning::$COUNT2 extra symbol(s) not in the reference (usually harmless):"
+            echo "$EXTRA" | sed 's/^/  EXTRA: /' | head -20
           fi
           echo "Symbol check PASSED."
 
