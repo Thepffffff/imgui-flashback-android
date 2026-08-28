@@ -134,8 +134,32 @@ jobs:
             echo "::error::No generated JNI source files found to rename"
             exit 1
           fi
-          # Negative lookahead so re-running this doesn't double-prefix
-          echo "$FILES" | xargs perl -pi -e 's/Java_imgui_(?!moulberry90_)/Java_imgui_moulberry90_/g'
+          # Negative lookahead so re-running this doesn't double-prefix.
+          # Two patterns are needed:
+          #  1. The enclosing class name right after "Java_"
+          #     (Java_imgui_ClassName_method -> Java_imgui_moulberry90_ClassName_method)
+          #  2. Any imgui object-type descriptor embedded in a JNI
+          #     overload-disambiguating suffix, e.g. a method overloaded
+          #     on an ImVec2 param encodes that param's type in the
+          #     symbol name itself: ...Limgui_ImVec2_2... needs to become
+          #     ...Limgui_moulberry90_ImVec2_2... too, or it won't match
+          #     bindings that reference other renamed imgui types.
+          echo "$FILES" | xargs perl -pi -e '
+            s/Java_imgui_(?!moulberry90_)/Java_imgui_moulberry90_/g;
+            s/Limgui_(?!moulberry90_)/Limgui_moulberry90_/g;
+
+            # --- one-off compatibility patch, not a general rule ---
+            # reference/libimgui-moulberry90-java64.so is ~8 months old;
+            # the newest available imgui_java_ref is only ~4 months old.
+            # Somewhere in between, ImGuiImplGlfwNative was moved from
+            # imgui(.moulberry90).glfw into imgui(.moulberry90).lwjgl3.glfw.
+            # There is no source at the exact commit the reference .so was
+            # built from, so the package cannot be regenerated correctly -
+            # instead we manually relocate just this one class back to
+            # match the reference. Remove this line if/when the true
+            # matching source ref is ever identified.
+            s/moulberry90_lwjgl3_glfw_ImGuiImplGlfwNative/moulberry90_glfw_ImGuiImplGlfwNative/g;
+          '
           echo "Renamed $(echo "$FILES" | wc -l) file(s)"
 
       # -------------------------------------------------------------------
