@@ -79,7 +79,11 @@ jobs:
       #  Upstream source: Moulberry's own imgui-java fork, at the exact
       #  ref you give it. This is the literal source the shipped .so is
       #  built from, package names and all - nothing gets renamed.
-      #  The fork already vendors everything it needs, so no submodules.
+      #
+      #  Submodules ARE required: the fork's .gitmodules maps include/imgui
+      #  to ocornut/imgui - that's where imgui.h / imgui.cpp actually live.
+      #  The generated JNI glue (imgui_ImDrawData.cpp etc.) just #includes
+      #  those headers; it doesn't vendor them itself.
       # -------------------------------------------------------------------
       - name: Clone Moulberry/imgui-java at the requested ref
         run: |
@@ -87,6 +91,7 @@ jobs:
           git clone "https://github.com/${UPSTREAM_REPO}.git" upstream
           cd upstream
           git checkout "${{ steps.cfg.outputs.ref }}"
+          git submodule update --init --recursive --depth 1
           echo "--- resolved commit ---"
           git log -1 --oneline
 
