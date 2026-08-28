@@ -57,12 +57,29 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
-          local-cache: true
+          # local-cache was disabled: a cached NDK restore was coming back
+          # incomplete (clang++ missing from toolchains/llvm/prebuilt/...),
+          # which is exactly the "not a full path to an existing compiler
+          # tool" error. Always doing a clean download avoids that.
+          local-cache: false
+
+      - name: Sanity-check NDK toolchain
+        run: |
+          set -euo pipefail
+          CLANGXX="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          echo "Expecting compiler at: $CLANGXX"
+          if [[ ! -x "$CLANGXX" ]]; then
+            echo "::error::clang++ missing or not executable at $CLANGXX"
+            ls -la "$(dirname "$CLANGXX")" || true
+            exit 1
+          fi
+          "$CLANGXX" --version
 
       # -------------------------------------------------------------------
       #  Upstream source: Moulberry's own imgui-java fork, at the exact
       #  ref you give it. This is the literal source the shipped .so is
       #  built from, package names and all - nothing gets renamed.
+      #  The fork already vendors everything it needs, so no submodules.
       # -------------------------------------------------------------------
       - name: Clone Moulberry/imgui-java at the requested ref
         run: |
@@ -70,7 +87,6 @@ jobs:
           git clone "https://github.com/${UPSTREAM_REPO}.git" upstream
           cd upstream
           git checkout "${{ steps.cfg.outputs.ref }}"
-          git submodule update --init --recursive --depth 1
           echo "--- resolved commit ---"
           git log -1 --oneline
 
@@ -153,6 +169,9 @@ jobs:
 
           find "$OUT" -name '*.so' -exec ls -la {} \;
 
+      # Kept: --strip-unneeded drops debug/local symbols but preserves the
+      # dynamic symbol table, so JNI functions (default visibility) still
+      # resolve fine at runtime. Standard practice for a shipped .so.
       - name: Strip (keep dynamic symbols)
         run: |
           set -euo pipefail
