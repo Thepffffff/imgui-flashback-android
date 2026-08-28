@@ -139,6 +139,14 @@ jobs:
 
           target_link_libraries(${LIB_NAME} PRIVATE android log)
 
+          # Android's NDK jni.h only defines up through JNI_VERSION_1_6 (ART
+          # doesn't support later JNI versions). The upstream JNI glue code
+          # was written against a desktop JDK's jni.h, which does define
+          # JNI_VERSION_1_8, so on Android that identifier is simply missing.
+          # 1_6 is both the fix and the semantically correct value here -
+          # it's what every Android JNI app already targets.
+          target_compile_definitions(${LIB_NAME} PRIVATE JNI_VERSION_1_8=JNI_VERSION_1_6)
+
           # 16 KB page size is required by Android 15+ devices
           target_link_options(${LIB_NAME} PRIVATE
             -Wl,-z,max-page-size=16384
