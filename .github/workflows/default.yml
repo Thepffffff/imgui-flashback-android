@@ -28,6 +28,16 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # -------------------------------------------------------------------
+      #  Checkout this repo, so the reference/ folder (containing the
+      #  known-good shipped .so used for binding verification) is present
+      #  in the runner workspace. None of the original steps checked out
+      #  this repo, so without this the verify step below has nothing to
+      #  read from reference/.
+      # -------------------------------------------------------------------
+      - name: Checkout repository (for reference/ binaries)
+        uses: actions/checkout@v4
+
       - name: Resolve inputs
         id: cfg
         run: |
@@ -106,6 +116,66 @@ jobs:
           ./gradlew --no-daemon :imgui-binding:generateLibs -Denvs=linux64 -Dlocal \
             || echo "::notice::generateLibs exited non-zero (host native link stage). Continuing if jni/ exists."
           ls imgui-binding/build/jni
+
+      # -------------------------------------------------------------------
+      #  Rename JNI bindings: imgui.* -> imgui.moulberry90.* so the
+      #  compiled symbol names match the shaded Java package the mod
+      #  actually ships (Java_imgui_ClassName_method ->
+      #  Java_imgui_moulberry90_ClassName_method). Literal "moulberry90",
+      #  not a parameterized moulberryNN.
+      # -------------------------------------------------------------------
+      - name: Rename JNI bindings to imgui.moulberry90 namespace
+        run: |
+          set -euo pipefail
+          JNI_DIR="$PWD/upstream/imgui-binding/build/jni"
+          echo "Renaming Java_imgui_* symbols to Java_imgui_moulberry90_* in $JNI_DIR"
+          FILES=$(find "$JNI_DIR" -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \))
+          if [[ -z "$FILES" ]]; then
+            echo "::error::No generated JNI source files found to rename"
+            exit 1
+          fi
+          # Negative lookahead so re-running this doesn't double-prefix
+          echo "$FILES" | xargs perl -pi -e 's/Java_imgui_(?!moulberry90_)/Java_imgui_moulberry90_/g'
+          echo "Renamed $(echo "$FILES" | wc -l) file(s)"
+
+      # -------------------------------------------------------------------
+      #  Verify the renamed bindings exactly match a known-good reference
+      #  binary before we bother compiling. Fails the build on any
+      #  mismatch (missing, extra, or misnamed binding).
+      # -------------------------------------------------------------------
+      - name: Verify generated bindings match reference binary
+        run: |
+          set -euo pipefail
+          NDK_NM="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          JNI_DIR="$PWD/upstream/imgui-binding/build/jni"
+
+          REF_BIN="$(find reference -maxdepth 1 -type f | sort | head -n1)"
+          if [[ -z "$REF_BIN" ]]; then
+            echo "::error::No reference binary found in reference/"
+            exit 1
+          fi
+          echo "Reference binary: $REF_BIN"
+
+          "$NDK_NM" -D --defined-only "$REF_BIN" 2>/dev/null \
+            | awk '{print $NF}' \
+            | grep '^Java_' \
+            | sort -u > ref_bindings.txt
+
+          grep -rhoE 'JNIEXPORT[^;{]*\bJava_[A-Za-z0-9_]+' "$JNI_DIR" --include='*.cpp' \
+            | grep -oE 'Java_[A-Za-z0-9_]+' \
+            | sort -u > src_bindings.txt
+
+          REF_COUNT=$(wc -l < ref_bindings.txt)
+          SRC_COUNT=$(wc -l < src_bindings.txt)
+          echo "Reference binding count: $REF_COUNT"
+          echo "Generated-source binding count: $SRC_COUNT"
+
+          if ! diff -u ref_bindings.txt src_bindings.txt; then
+            echo "::error::Binding names in generated JNI sources do not match the reference binary"
+            exit 1
+          fi
+
+          echo "All $REF_COUNT bindings match the reference binary."
 
       # -------------------------------------------------------------------
       #  CMake project for the Android build
