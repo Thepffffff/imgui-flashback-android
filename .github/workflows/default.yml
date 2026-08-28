@@ -26,15 +26,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
-      # -------------------------------------------------------------------
-      #  Checkout this repo, so the reference/ folder (containing the
-      #  known-good shipped .so used for binding verification) is present
-      #  in the runner workspace. None of the original steps checked out
-      #  this repo, so without this the verify step below has nothing to
-      #  read from reference/.
-      # -------------------------------------------------------------------
       - name: Checkout repository (for reference/ binaries)
         uses: actions/checkout@v4
 
@@ -43,19 +35,16 @@ jobs:
         run: |
           set -euo pipefail
           echo "abis=${{ inputs.abis || 'arm64-v8a' }}" >> "$GITHUB_OUTPUT"
-          echo "api=${{ inputs.android_api || '24' }}"  >> "$GITHUB_OUTPUT"
-          echo "ref=${{ inputs.imgui_java_ref }}"         >> "$GITHUB_OUTPUT"
+          echo "api=${{ inputs.android_api || '24' }}" >> "$GITHUB_OUTPUT"
+          echo "ref=${{ inputs.imgui_java_ref }}" >> "$GITHUB_OUTPUT"
 
-      # -------------------------------------------------------------------
-      #  Toolchain
-      # -------------------------------------------------------------------
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install host build deps (needed by the codegen step)
+      - name: Install host build deps
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -67,10 +56,6 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
-          # local-cache was disabled: a cached NDK restore was coming back
-          # incomplete (clang++ missing from toolchains/llvm/prebuilt/...),
-          # which is exactly the "not a full path to an existing compiler
-          # tool" error. Always doing a clean download avoids that.
           local-cache: false
 
       - name: Sanity-check NDK toolchain
@@ -85,16 +70,6 @@ jobs:
           fi
           "$CLANGXX" --version
 
-      # -------------------------------------------------------------------
-      #  Upstream source: Moulberry's own imgui-java fork, at the exact
-      #  ref you give it. This is the literal source the shipped .so is
-      #  built from, package names and all - nothing gets renamed.
-      #
-      #  Submodules ARE required: the fork's .gitmodules maps include/imgui
-      #  to ocornut/imgui - that's where imgui.h / imgui.cpp actually live.
-      #  The generated JNI glue (imgui_ImDrawData.cpp etc.) just #includes
-      #  those headers; it doesn't vendor them itself.
-      # -------------------------------------------------------------------
       - name: Clone Moulberry/imgui-java at the requested ref
         run: |
           set -euo pipefail
@@ -105,9 +80,6 @@ jobs:
           echo "--- resolved commit ---"
           git log -1 --oneline
 
-      # -------------------------------------------------------------------
-      #  Generate the JNI C++ (host-side codegen)
-      # -------------------------------------------------------------------
       - name: Generate JNI sources
         run: |
           set -euo pipefail
@@ -117,147 +89,103 @@ jobs:
             || echo "::notice::generateLibs exited non-zero (host native link stage). Continuing if jni/ exists."
           ls imgui-binding/build/jni
 
-      # -------------------------------------------------------------------
-      #  Rename JNI bindings: imgui.* -> imgui.moulberry90.* so the
-      #  compiled symbol names match the shaded Java package the mod
-      #  actually ships (Java_imgui_ClassName_method ->
-      #  Java_imgui_moulberry90_ClassName_method). Literal "moulberry90",
-      #  not a parameterized moulberryNN.
-      # -------------------------------------------------------------------
       - name: Rename JNI bindings to imgui.moulberry90 namespace
         run: |
           set -euo pipefail
           JNI_DIR="$PWD/upstream/imgui-binding/build/jni"
-          echo "Renaming Java_imgui_* symbols to Java_imgui_moulberry90_* in $JNI_DIR"
+          echo "Renaming imgui -> imgui.moulberry90 in $JNI_DIR"
+
           FILES=$(find "$JNI_DIR" -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \))
           if [[ -z "$FILES" ]]; then
             echo "::error::No generated JNI source files found to rename"
             exit 1
           fi
-          # Negative lookahead so re-running this doesn't double-prefix.
-          # Two patterns are needed:
-          #  1. The enclosing class name right after "Java_"
-          #     (Java_imgui_ClassName_method -> Java_imgui_moulberry90_ClassName_method)
-          #  2. Any imgui object-type descriptor embedded in a JNI
-          #     overload-disambiguating suffix, e.g. a method overloaded
-          #     on an ImVec2 param encodes that param's type in the
-          #     symbol name itself: ...Limgui_ImVec2_2... needs to become
-          #     ...Limgui_moulberry90_ImVec2_2... too, or it won't match
-          #     bindings that reference other renamed imgui types.
+
           echo "$FILES" | xargs perl -pi -e '
+            unless (/^\s*#\s*include/) {
+              s{"imgui/(?!moulberry90/)}{"imgui/moulberry90/}g;
+              s{Limgui/(?!moulberry90/)}{Limgui/moulberry90/}g;
+            }
             s/Java_imgui_(?!moulberry90_)/Java_imgui_moulberry90_/g;
             s/Limgui_(?!moulberry90_)/Limgui_moulberry90_/g;
-
-            # --- one-off compatibility patch, not a general rule ---
-            # reference/libimgui-moulberry90-java64.so is ~8 months old;
-            # the newest available imgui_java_ref is only ~4 months old.
-            # Somewhere in between, ImGuiImplGlfwNative was moved from
-            # imgui(.moulberry90).glfw into imgui(.moulberry90).lwjgl3.glfw.
-            # There is no source at the exact commit the reference .so was
-            # built from, so the package cannot be regenerated correctly -
-            # instead we manually relocate just this one class back to
-            # match the reference. Remove this line if/when the true
-            # matching source ref is ever identified.
             s/moulberry90_lwjgl3_glfw_ImGuiImplGlfwNative/moulberry90_glfw_ImGuiImplGlfwNative/g;
+            s{moulberry90/lwjgl3/glfw/ImGuiImplGlfwNative}{moulberry90/glfw/ImGuiImplGlfwNative}g;
           '
           echo "Renamed $(echo "$FILES" | wc -l) file(s)"
 
-      # -------------------------------------------------------------------
-      #  Verify the renamed bindings exactly match a known-good reference
-      #  binary before we bother compiling. Fails the build on any
-      #  mismatch (missing, extra, or misnamed binding).
-      # -------------------------------------------------------------------
+          LEFTOVERS=$(grep -rnP '"[^"]*L?imgui/(?!moulberry90/)' "$JNI_DIR" \
+            --include='*.cpp' --include='*.h' --include='*.hpp' \
+            | grep -vP '^\s*[^:]+:\d+:\s*#\s*include' || true)
+          if [[ -n "$LEFTOVERS" ]]; then
+            echo "::error::Un-renamed imgui/ string literals remain"
+            echo "$LEFTOVERS"
+            exit 1
+          fi
+          echo "No un-renamed imgui/ literals remain."
+
       - name: Verify generated bindings match reference binary
         run: |
           set -euo pipefail
           NDK_NM="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           JNI_DIR="$PWD/upstream/imgui-binding/build/jni"
-
           REF_BIN="$(find reference -maxdepth 1 -type f | sort | head -n1)"
           if [[ -z "$REF_BIN" ]]; then
             echo "::error::No reference binary found in reference/"
             exit 1
           fi
           echo "Reference binary: $REF_BIN"
-
           "$NDK_NM" -D --defined-only "$REF_BIN" 2>/dev/null \
             | awk '{print $NF}' \
             | grep '^Java_' \
             | sort -u > ref_bindings.txt
-
           grep -rhoE 'JNIEXPORT[^;{]*\bJava_[A-Za-z0-9_]+' "$JNI_DIR" --include='*.cpp' \
             | grep -oE 'Java_[A-Za-z0-9_]+' \
             | sort -u > src_bindings.txt
-
           REF_COUNT=$(wc -l < ref_bindings.txt)
           SRC_COUNT=$(wc -l < src_bindings.txt)
           echo "Reference binding count: $REF_COUNT"
           echo "Generated-source binding count: $SRC_COUNT"
-
           if ! diff -u ref_bindings.txt src_bindings.txt; then
             echo "::error::Binding names in generated JNI sources do not match the reference binary"
             exit 1
           fi
-
           echo "All $REF_COUNT bindings match the reference binary."
 
-      # -------------------------------------------------------------------
-      #  CMake project for the Android build
-      # -------------------------------------------------------------------
       - name: Write CMakeLists
         run: |
           set -euo pipefail
           cat > upstream/imgui-binding/build/jni/CMakeLists.txt <<'CMAKE'
           cmake_minimum_required(VERSION 3.22)
           project(imgui_moulberry90_jni CXX)
-
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
           set(CMAKE_CXX_VISIBILITY_PRESET default)
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
           if(NOT DEFINED LIB_NAME)
             message(FATAL_ERROR "Pass -DLIB_NAME=<library base name>")
           endif()
-
           file(GLOB_RECURSE SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
           add_library(${LIB_NAME} SHARED ${SRC})
-
           target_include_directories(${LIB_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-
           target_compile_options(${LIB_NAME} PRIVATE
             -O2 -fno-strict-aliasing
             -Wno-unused-function -Wno-unused-variable
             -Wno-deprecated-declarations -Wno-unused-but-set-variable
           )
-
           target_link_libraries(${LIB_NAME} PRIVATE android log)
-
-          # Android's NDK jni.h only defines up through JNI_VERSION_1_6 (ART
-          # doesn't support later JNI versions). The upstream JNI glue code
-          # was written against a desktop JDK's jni.h, which does define
-          # JNI_VERSION_1_8, so on Android that identifier is simply missing.
-          # 1_6 is both the fix and the semantically correct value here -
-          # it's what every Android JNI app already targets.
           target_compile_definitions(${LIB_NAME} PRIVATE JNI_VERSION_1_8=JNI_VERSION_1_6)
-
-          # 16 KB page size is required by Android 15+ devices
           target_link_options(${LIB_NAME} PRIVATE
             -Wl,-z,max-page-size=16384
             -Wl,--build-id=sha1
           )
           CMAKE
 
-      # -------------------------------------------------------------------
-      #  Compile per ABI
-      # -------------------------------------------------------------------
       - name: Build native library
         run: |
           set -euo pipefail
           JNI_DIR="$PWD/upstream/imgui-binding/build/jni"
           OUT="$PWD/artifacts"
           mkdir -p "$OUT"
-
           for ABI in ${{ steps.cfg.outputs.abis }}; do
             echo "::group::Building $ABI"
             cmake -S "$JNI_DIR" -B "build-$ABI" -G Ninja \
@@ -273,12 +201,8 @@ jobs:
             cp "build-$ABI/lib${LIB_BASENAME}.so" "$OUT/$ABI/"
             echo "::endgroup::"
           done
-
           find "$OUT" -name '*.so' -exec ls -la {} \;
 
-      # Kept: --strip-unneeded drops debug/local symbols but preserves the
-      # dynamic symbol table, so JNI functions (default visibility) still
-      # resolve fine at runtime. Standard practice for a shipped .so.
       - name: Strip (keep dynamic symbols)
         run: |
           set -euo pipefail
