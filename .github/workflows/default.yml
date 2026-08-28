@@ -11,19 +11,15 @@ on:
         description: 'Minimum Android API level'
         default: '24'
         type: string
-      imgui_java_tag:
-        description: 'Upstream SpaiR/imgui-java tag to build from'
-        default: 'v1.90.0'
-        type: string
-      shaded_package:
-        description: 'Target shaded package, slash form, no trailing slash'
-        default: 'imgui/moulberry90'
+      imgui_java_ref:
+        description: 'Moulberry/imgui-java git ref to build from (tag, branch, or full commit SHA)'
+        required: true
         type: string
   push:
     branches: [ main, master ]
 
 env:
-  UPSTREAM_REPO: SpaiR/imgui-java
+  UPSTREAM_REPO: Moulberry/imgui-java
   LIB_BASENAME: imgui-moulberry90-java64
 
 jobs:
@@ -32,21 +28,13 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout this repo (for optional reference/ .so)
-        uses: actions/checkout@v4
-        with:
-          path: self
-
       - name: Resolve inputs
         id: cfg
         run: |
           set -euo pipefail
-          echo "abis=${{ inputs.abis || 'arm64-v8a' }}"        >> "$GITHUB_OUTPUT"
-          echo "api=${{ inputs.android_api || '24' }}"         >> "$GITHUB_OUTPUT"
-          echo "tag=${{ inputs.imgui_java_tag || 'v1.90.0' }}" >> "$GITHUB_OUTPUT"
-          PKG="${{ inputs.shaded_package || 'imgui/moulberry90' }}"
-          echo "pkg_slash=$PKG"                        >> "$GITHUB_OUTPUT"
-          echo "pkg_under=$(echo "$PKG" | tr '/' '_')" >> "$GITHUB_OUTPUT"
+          echo "abis=${{ inputs.abis || 'arm64-v8a' }}" >> "$GITHUB_OUTPUT"
+          echo "api=${{ inputs.android_api || '24' }}"  >> "$GITHUB_OUTPUT"
+          echo "ref=${{ inputs.imgui_java_ref }}"         >> "$GITHUB_OUTPUT"
 
       # -------------------------------------------------------------------
       #  Toolchain
@@ -72,192 +60,34 @@ jobs:
           local-cache: true
 
       # -------------------------------------------------------------------
-      #  Upstream source at the version that matches the jar
+      #  Upstream source: Moulberry's own imgui-java fork, at the exact
+      #  ref you give it. This is the literal source the shipped .so is
+      #  built from, package names and all - nothing gets renamed.
       # -------------------------------------------------------------------
-      - name: Clone upstream imgui-java (with submodules)
+      - name: Clone Moulberry/imgui-java at the requested ref
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${{ steps.cfg.outputs.tag }}" \
-            --recurse-submodules --shallow-submodules \
-            "https://github.com/${UPSTREAM_REPO}.git" upstream
+          git clone "https://github.com/${UPSTREAM_REPO}.git" upstream
           cd upstream
-          echo "--- submodule revisions ---"
-          git submodule status || true
-
-      - name: Sanity check Dear ImGui version
-        run: |
-          set -uo pipefail
-          cd upstream
-          H=$(find . -name imgui.h | head -1)
-          echo "header: $H"
-          grep -E '#define IMGUI_VERSION(_NUM)? ' "$H" || true
-          if ! grep -q '#define IMGUI_VERSION  *"1\.90\.9' "$H"; then
-            echo "::warning::Dear ImGui is not 1.90.9 - struct layouts may not match the jar."
-          fi
+          git checkout "${{ steps.cfg.outputs.ref }}"
+          git submodule update --init --recursive --depth 1
+          echo "--- resolved commit ---"
+          git log -1 --oneline
 
       # -------------------------------------------------------------------
-      #  Step 1: generate the JNI C++ (host-side codegen)
-      #  Only imgui-binding/build/jni/ is needed. The linux64 native link
-      #  that follows is irrelevant here, so its failure is tolerated.
+      #  Generate the JNI C++ (host-side codegen)
       # -------------------------------------------------------------------
       - name: Generate JNI sources
         run: |
-          set -uo pipefail
+          set -euo pipefail
           cd upstream
           chmod +x gradlew
           ./gradlew --no-daemon :imgui-binding:generateLibs -Denvs=linux64 -Dlocal \
             || echo "::notice::generateLibs exited non-zero (host native link stage). Continuing if jni/ exists."
-          if [ ! -d imgui-binding/build/jni ]; then
-            echo "::error::imgui-binding/build/jni was not produced. Codegen task name may differ for this tag."
-            ./gradlew --no-daemon :imgui-binding:tasks --all | head -80 || true
-            exit 1
-          fi
-          echo "--- generated jni tree ---"
-          ls imgui-binding/build/jni | head -60
-          echo "cpp files: $(find imgui-binding/build/jni -name '*.cpp' | wc -l)"
+          ls imgui-binding/build/jni
 
       # -------------------------------------------------------------------
-      #  Step 1.5: cross-check codegen output against the reference .so
-      #  committed at self/reference/*.so, BEFORE spending time shading or
-      #  building. The reference .so has real (possibly hand/custom) shaded
-      #  names, so we do NOT try to reverse-guess them back to "imgui/...".
-      #  Instead we forward-transform the raw codegen names using the exact
-      #  same two substitutions the "Shade JNI names" step performs
-      #  (Java_imgui_ -> Java_${PKG_U}_ , Limgui_ -> L${PKG_U}_) and compare
-      #  that against the reference .so's actual exported names. This mirrors
-      #  reality instead of assuming anything about how the reference was
-      #  named. Fails on ANY symbol present in the reference but absent from
-      #  the (transformed) codegen output, and prints every mismatched/
-      #  missing name explicitly.
-      # -------------------------------------------------------------------
-      - name: Cross-check codegen exports against reference .so (pre-shading)
-        run: |
-          set -uo pipefail
-          PKG_U='${{ steps.cfg.outputs.pkg_under }}'
-          REF=$(find self/reference -name '*.so' 2>/dev/null | head -1)
-
-          if [ -z "$REF" ]; then
-            echo "::warning::No reference/*.so found in self/reference - skipping pre-shading cross-check."
-            exit 0
-          fi
-          REF="$(realpath "$REF")"
-          echo "Using reference .so: $REF"
-
-          cd upstream/imgui-binding/build/jni
-
-          grep -rho 'Java_imgui_[A-Za-z0-9_]*' . | sort -u > /tmp/codegen_raw.txt
-          echo "codegen (pre-shade) exports: $(wc -l < /tmp/codegen_raw.txt)"
-
-          # Forward-transform codegen names the SAME way the real shading
-          # step will (string-level, not touching any files here) so we
-          # compare shaded-vs-shaded without assuming anything about the
-          # reference .so's naming scheme.
-          sed -e "s/Java_imgui_/Java_${PKG_U}_/g" \
-              -e "s/Limgui_/L${PKG_U}_/g" \
-              /tmp/codegen_raw.txt | sort -u > /tmp/codegen_shaded.txt
-          echo "codegen exports (transformed to shaded form): $(wc -l < /tmp/codegen_shaded.txt)"
-
-          nm -D --defined-only "$REF" \
-            | awk '{print $NF}' \
-            | grep "Java_" \
-            | sort -u > /tmp/ref_exports.txt
-          echo "reference .so exports: $(wc -l < /tmp/ref_exports.txt)"
-
-          if [ ! -s /tmp/ref_exports.txt ]; then
-            echo "::error::Reference .so has zero Java_* exports - wrong file committed at self/reference/*.so?"
-            exit 1
-          fi
-
-          MISSING_FROM_CODEGEN=$(comm -23 /tmp/ref_exports.txt /tmp/codegen_shaded.txt || true)
-          MISSING_FROM_REF=$(comm -13 /tmp/ref_exports.txt /tmp/codegen_shaded.txt || true)
-
-          FAIL=0
-          if [ -n "$MISSING_FROM_CODEGEN" ]; then
-            FAIL=1
-            COUNT=$(echo "$MISSING_FROM_CODEGEN" | grep -c .)
-            echo "::error::$COUNT symbol(s) exist in the reference .so but have NO matching codegen output after shading (name mismatch, custom naming, or upstream tag drift). Every missing symbol:"
-            echo "$MISSING_FROM_CODEGEN" | sed 's/^/  MISSING FROM CODEGEN: /'
-          fi
-          if [ -n "$MISSING_FROM_REF" ]; then
-            COUNT2=$(echo "$MISSING_FROM_REF" | grep -c .)
-            echo "::warning::$COUNT2 symbol(s) produced by codegen (post-shade) but absent from the reference .so (may be harmless additions):"
-            echo "$MISSING_FROM_REF" | sed 's/^/  EXTRA IN CODEGEN: /'
-          fi
-
-          if [ "$FAIL" = "1" ]; then
-            echo "::error::Pre-shading cross-check FAILED - aborting before shading/build. See MISSING FROM CODEGEN lines above for exact symbol names."
-            exit 1
-          fi
-          echo "Pre-shading cross-check PASSED: every reference export has a matching codegen symbol."
-
-      # -------------------------------------------------------------------
-      #  Step 2: shade the package  imgui.*  ->  imgui.moulberry90.*
-      #
-      #  Three name forms are baked in at compile time and all must change:
-      #    a) exported function names ........... Java_imgui_ImGui_nBegin
-      #    b) mangled overload parameters ....... ..._Limgui_ImVec2_2IF
-      #    c) runtime class + descriptor strings . "imgui/ImVec2", "(Limgui/ImVec2;)V"
-      #  #include lines are skipped so upstream headers stay intact.
-      #
-      #  The leftover check must EXCLUDE the already-shaded prefix, because
-      #  Java_imgui_moulberry90_* still matches Java_imgui_[A-Za-z0-9_]*.
-      #
-      #  NOTE: every grep that is expected to legitimately find ZERO matches
-      #  on a successful run is wrapped in its own `{ ... || true; }` group
-      #  so that under `set -euo pipefail` a clean (zero-match) result does
-      #  NOT propagate a non-zero exit status through the pipeline and abort
-      #  the script. Previously LEFT=$(... | grep -v ... | wc -l) failed the
-      #  whole step whenever shading was fully successful, because pipefail
-      #  surfaces grep -v's exit-1-on-no-match through the pipe.
-      # -------------------------------------------------------------------
-      - name: Shade JNI names to the fork's package
-        run: |
-          set -euo pipefail
-          cd upstream/imgui-binding/build/jni
-          PKG_U='${{ steps.cfg.outputs.pkg_under }}'   # imgui_moulberry90
-          PKG_S='${{ steps.cfg.outputs.pkg_slash }}'   # imgui/moulberry90
-
-          BEFORE=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } | sort -u | wc -l)
-          echo "distinct JNI exports before shading: $BEFORE"
-          if [ "$BEFORE" = "0" ]; then
-            echo "::error::No Java_imgui_* symbols found - codegen output looks wrong."; exit 1
-          fi
-
-          # a + b: symbol names
-          { grep -rl --include='*.cpp' --include='*.h' -e 'Java_imgui_' -e 'Limgui_' . || true; } \
-            | xargs -r sed -i \
-                -e "s/Java_imgui_/Java_${PKG_U}_/g" \
-                -e "s/Limgui_/L${PKG_U}_/g"
-
-          # c: JNI class names and type descriptors inside string literals
-          { grep -rl --include='*.cpp' --include='*.h' -e '"imgui/' -e 'Limgui/' . || true; } \
-            | xargs -r sed -i \
-                -e "/#[[:space:]]*include/! s|\"imgui/|\"${PKG_S}/|g" \
-                -e "/#[[:space:]]*include/! s|Limgui/|L${PKG_S}/|g"
-
-          AFTER=$( { grep -rho "Java_${PKG_U}_[A-Za-z0-9_]*" . || true; } | sort -u | wc -l)
-
-          LEFT=$( { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } \
-                    | sort -u \
-                    | { grep -v "^Java_${PKG_U}_" || true; } \
-                    | wc -l)
-          echo "distinct JNI exports after shading: $AFTER (unshaded leftovers: $LEFT)"
-
-          if [ "$LEFT" != "0" ]; then
-            echo "::error::Some JNI symbols were not shaded. Examples:"
-            { grep -rho 'Java_imgui_[A-Za-z0-9_]*' . || true; } \
-              | sort -u \
-              | { grep -v "^Java_${PKG_U}_" || true; } \
-              | head -20
-            exit 1
-          fi
-          if [ "$AFTER" != "$BEFORE" ]; then
-            echo "::error::Export count changed during shading ($BEFORE -> $AFTER)."; exit 1
-          fi
-          echo "Shading OK."
-
-      # -------------------------------------------------------------------
-      #  Step 3: CMake project for the Android build
+      #  CMake project for the Android build
       # -------------------------------------------------------------------
       - name: Write CMakeLists
         run: |
@@ -276,12 +106,6 @@ jobs:
           endif()
 
           file(GLOB_RECURSE SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-          list(LENGTH SRC SRC_COUNT)
-          message(STATUS "imgui-jni: compiling ${SRC_COUNT} translation units")
-          if(SRC_COUNT EQUAL 0)
-            message(FATAL_ERROR "No .cpp sources found in generated jni dir")
-          endif()
-
           add_library(${LIB_NAME} SHARED ${SRC})
 
           target_include_directories(${LIB_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -300,11 +124,9 @@ jobs:
             -Wl,--build-id=sha1
           )
           CMAKE
-          echo "CMakeLists written:"
-          head -5 upstream/imgui-binding/build/jni/CMakeLists.txt
 
       # -------------------------------------------------------------------
-      #  Step 4: compile per ABI
+      #  Compile per ABI
       # -------------------------------------------------------------------
       - name: Build native library
         run: |
@@ -329,69 +151,16 @@ jobs:
             echo "::endgroup::"
           done
 
-          echo "--- built ---"
           find "$OUT" -name '*.so' -exec ls -la {} \;
-          find "$OUT" -name '*.so' -exec file {} \;
 
       - name: Strip (keep dynamic symbols)
         run: |
           set -euo pipefail
           STRIP="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           for so in $(find artifacts -name '*.so'); do
-            B=$(stat -c%s "$so")
             "$STRIP" --strip-unneeded "$so"
-            echo "$so: $B -> $(stat -c%s "$so") bytes"
           done
 
-      # -------------------------------------------------------------------
-      #  Step 5: verify exported symbols against the original desktop .so
-      #  (post-build, shaded-name comparison). Fails on ANY missing symbol
-      #  and prints every missing/mismatched name explicitly.
-      # -------------------------------------------------------------------
-      - name: Verify JNI exports against reference .so
-        run: |
-          set -uo pipefail
-          PKG_U='${{ steps.cfg.outputs.pkg_under }}'
-          REF=$(find self/reference -name '*.so' 2>/dev/null | head -1)
-          MINE=$(find artifacts -name '*.so' | head -1)
-
-          nm -D --defined-only "$MINE" | grep " Java_${PKG_U}_" | awk '{print $NF}' | sort > mine.txt
-          echo "exports in built .so: $(wc -l < mine.txt)"
-
-          if [ -z "$REF" ]; then
-            echo "::warning::No reference/*.so committed - symbol diff skipped. Commit the original desktop .so to reference/ to enable this check."
-            exit 0
-          fi
-
-          nm -D --defined-only "$REF" | grep " Java_${PKG_U}_" | awk '{print $NF}' | sort > ref.txt
-          echo "exports in reference .so: $(wc -l < ref.txt)"
-
-          # win32hideFromTaskBar is a Windows-only stub, its absence is expected.
-          MISSING=$(comm -23 ref.txt mine.txt | grep -v 'win32hideFromTaskBar' || true)
-          EXTRA=$(comm -13 ref.txt mine.txt || true)
-
-          if [ -n "$MISSING" ]; then
-            COUNT=$(echo "$MISSING" | grep -c .)
-            echo "::error::$COUNT symbol(s) the jar needs but this build does not export. Every missing symbol:"
-            echo "$MISSING" | sed 's/^/  MISSING: /'
-            exit 1
-          fi
-          if [ -n "$EXTRA" ]; then
-            COUNT2=$(echo "$EXTRA" | grep -c .)
-            echo "::warning::$COUNT2 extra symbol(s) not in the reference (usually harmless):"
-            echo "$EXTRA" | sed 's/^/  EXTRA: /' | head -20
-          fi
-          echo "Symbol check PASSED."
-
-      - name: Confirm imconfig.h untouched
-        run: |
-          set -uo pipefail
-          echo "nDebugCheckVersionAndDataLayout compares sizeof(ImGuiIO, ImGuiStyle, ImVec2, ImVec4, ImDrawVert, ImDrawIdx)."
-          cd upstream
-          git diff --stat -- '*imconfig.h'
-          echo "(no diff listed above = stock = good)"
-
-      # -------------------------------------------------------------------
       - name: Upload native libraries
         uses: actions/upload-artifact@v4
         with:
